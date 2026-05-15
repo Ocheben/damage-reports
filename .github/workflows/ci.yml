@@ -1,0 +1,118 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  api:
+    name: API · PHPUnit + PHPStan + Pint
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: api
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: 8.4
+          extensions: pdo_sqlite, zip, intl, bcmath, mbstring, opcache
+          coverage: none
+
+      - name: Cache composer dependencies
+        uses: actions/cache@v4
+        with:
+          path: api/vendor
+          key: ${{ runner.os }}-composer-${{ hashFiles('api/composer.lock') }}
+          restore-keys: ${{ runner.os }}-composer-
+
+      - name: Install composer dependencies
+        run: composer install --no-interaction --prefer-dist
+
+      - name: Pint (code style)
+        run: vendor/bin/pint --test
+
+      - name: PHPStan (static analysis)
+        run: vendor/bin/phpstan analyse --memory-limit=512M --no-progress
+
+      - name: PHPUnit
+        run: vendor/bin/phpunit --no-progress
+
+  client:
+    name: Client · Vitest + TypeScript + ESLint
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          # Kubb's CLI uses node:util.styleText (added in 20.12), but the
+          # safer floor is 22 LTS which has it stable.
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+
+      - name: Install dependencies
+        # postinstall runs `npm run generate` which requires the spec at
+        # ../docs/openapi.yaml — the checkout step put it there.
+        run: npm ci
+
+      - name: Generate API SDK (idempotent — postinstall already ran it)
+        run: npm run generate
+
+      - name: ESLint
+        run: npm run lint
+
+      - name: TypeScript
+        run: npm run typecheck
+
+      - name: Vitest
+        run: npm test
+
+  smoke:
+    name: Smoke · docker compose up
+    runs-on: ubuntu-latest
+    needs: [api, client]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build & start
+        run: docker compose up -d --build --wait
+        timeout-minutes: 5
+
+      - name: Probe health endpoint
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8088/up >/dev/null; then
+              echo "API healthy"
+              break
+            fi
+            sleep 2
+          done
+          curl -fsS http://localhost:8088/up
+
+      - name: Probe flag evaluation
+        run: |
+          set -euo pipefail
+          curl -fsS -X POST http://localhost:8088/api/v1/flags/evaluate \
+            -H 'Content-Type: application/json' \
+            -d '{}' \
+            | tee /tmp/eval.json
+          # Smoke assertion: response includes the seeded report-photos flag.
+          grep -q '"report-photos"' /tmp/eval.json
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose logs --no-color
