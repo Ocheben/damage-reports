@@ -61,8 +61,12 @@ docker run --rm -v "$(pwd)/api:/app" -w /app composer:2 \
 # 53 tests, 178 assertions; PHPStan: 0 errors at level 6
 ```
 
-Client (Vitest + ESLint + TypeScript) — requires Node 22 (Kubb CLI uses
-`node:util.styleText`):
+Client (Vitest + ESLint + TypeScript):
+
+> **Node 22 required.** Kubb's CLI imports `node:util.styleText`, which is
+> only available on Node 20.12+ and stable on 22. If `npm ci` errors with
+> `does not provide an export named 'styleText'`, switch to Node 22
+> (`nvm install 22 && nvm use 22`).
 
 ```bash
 cd client

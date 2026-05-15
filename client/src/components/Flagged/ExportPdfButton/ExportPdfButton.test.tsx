@@ -11,7 +11,10 @@ import { ExportPdfButton } from "./ExportPdfButton";
 const ON: FlagSet = { "export-pdf": { value: true, reason: "default" } };
 const OFF: FlagSet = { "export-pdf": { value: false, reason: "default" } };
 
+let currentFlags: FlagSet = {};
+
 function mount(ui: React.ReactNode, flags: FlagSet) {
+  currentFlags = flags;
   return render(
     <ToastProvider>
       <FeatureFlagProvider initialFlags={flags}>{ui}</FeatureFlagProvider>
@@ -23,14 +26,15 @@ const fetchMock = vi.fn();
 
 beforeEach(() => {
   fetchMock.mockReset();
+  currentFlags = {};
   fetchMock.mockImplementation((input: RequestInfo | URL) => {
     const url = String(input);
     if (url.includes("/api/v1/flags/evaluate")) {
       return Promise.resolve(
-        new Response(JSON.stringify({ flags: {}, evaluated_at: new Date().toISOString() }), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        }),
+        new Response(
+          JSON.stringify({ flags: currentFlags, evaluated_at: new Date().toISOString() }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
       );
     }
     if (url.endsWith("/export-pdf")) {
