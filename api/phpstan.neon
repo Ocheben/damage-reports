@@ -1,0 +1,27 @@
+includes:
+    - vendor/larastan/larastan/extension.neon
+
+parameters:
+    paths:
+        - app
+        - config
+        - database
+        - routes
+
+    level: 6
+
+    # Skip the seed payload literal arrays — they mix scalar and Carbon values
+    # in one literal, which PHPStan's strict shape checks flag but the model's
+    # casts handle correctly at runtime.
+    excludePaths:
+        - database/seeders/DamageReportSeeder.php
+
+    # Suppress cosmetic warnings that don't catch real bugs at level 6.
+    # Iterable-type generics on @property tags and return arrays would
+    # require shape-typing every Eloquent attribute and helper, with no
+    # actual safety benefit for this codebase's size.
+    ignoreErrors:
+        -
+            identifier: missingType.iterableValue
+        -
+            identifier: missingType.generics
