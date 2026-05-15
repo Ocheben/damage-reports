@@ -1,0 +1,73 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build:
+      context: ./api
+    environment:
+      APP_ENV: local
+      APP_DEBUG: "true"
+      # APP_KEY auto-generated on first run by entrypoint.sh and persisted on
+      # the SQLite volume — survives container restarts without shipping a
+      # known key in the repo. To pin a specific key, set it here.
+      APP_URL: http://localhost:8088
+      LOG_CHANNEL: stderr
+      # `php -S` is single-threaded by default; multi-worker mode forks N
+      # workers so concurrent requests don't queue. 4 is comfortable for
+      # the demo now that there are no long-lived SSE connections holding
+      # workers hostage. For real prod this'd be nginx + php-fpm or
+      # Laravel Octane.
+      PHP_CLI_SERVER_WORKERS: "4"
+      DB_CONNECTION: sqlite
+      DB_DATABASE: /var/lib/sqlite/database.sqlite
+      CACHE_STORE: redis
+      SESSION_DRIVER: array
+      QUEUE_CONNECTION: sync
+      REDIS_CLIENT: predis
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      FRONTEND_ORIGIN: "http://localhost:3000,http://localhost:3030"
+      FLAG_CACHE_TTL: "900"
+      FLAG_PUBLIC_RESPONSE_CACHE_SECONDS: "15"
+      FLAG_DECISION_LOG_SAMPLE_RATE: "1.0"
+      FLAG_DECISION_LOG_RETENTION_DAYS: "30"
+    ports:
+      - "8088:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - api-db:/var/lib/sqlite
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/up"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  client:
+    build:
+      # Context is the repo root so the build can reach docs/openapi.yaml
+      # (Kubb's input). The client Dockerfile path is explicit because of that.
+      context: .
+      dockerfile: ./client/Dockerfile
+      args:
+        NEXT_PUBLIC_API_BASE: http://localhost:8088
+    environment:
+      API_BASE_INTERNAL: http://api:8000
+      NEXT_PUBLIC_API_BASE: http://localhost:8088
+    ports:
+      - "3000:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  api-db:
