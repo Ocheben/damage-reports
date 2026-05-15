@@ -1,0 +1,668 @@
+openapi: 3.0.3
+info:
+  title: Feature Flag Service API
+  version: "1.0"
+  description: |
+    Public + admin HTTP API for the feature flag service.
+
+    Auth model:
+      - Public read endpoints accept anonymous traffic. Pass a Sanctum bearer
+        to scope the response to a real user (attribute rules, user targeting).
+      - Mutating endpoints require `Authorization: Bearer <user-token>`.
+      - Admin endpoints require `Authorization: Bearer <admin-token>` and are
+        intended for the Next.js server only; the browser never sees this
+        token in production.
+servers:
+  - url: http://localhost:8088
+    description: Local dev (docker compose)
+
+tags:
+  - name: Health
+    description: Liveness probe.
+  - name: Flags
+    description: Public flag evaluation (the hot path).
+  - name: Reports
+    description: Car damage reports CRUD (gated by feature flags).
+  - name: Admin
+    description: Flag management + decision log (admin token required).
+
+paths:
+  /up:
+    get:
+      tags: [Health]
+      operationId: healthCheck
+      summary: Health check
+      responses:
+        "200":
+          description: Service alive.
+
+  /api/v1/flags/evaluate:
+    post:
+      tags: [Flags]
+      operationId: evaluateFlags
+      summary: Evaluate every flag for the requesting context
+      description: |
+        Returns one entry per active flag. Reasons follow the pattern
+        `default | disabled | scheduled_not_yet_active | scheduled_expired |
+        matched:<rule_type> | client_override:<…>`.
+
+        The response is ETag-tagged; sending a matching `If-None-Match`
+        header receives `304 Not Modified`. Rate-limited at 60 req/min/user.
+      security:
+        - sanctumBearer: []
+        - {}
+      responses:
+        "200":
+          description: Flag set for the context.
+          headers:
+            ETag:
+              schema: { type: string }
+            Cache-Control:
+              schema: { type: string, example: "private, max-age=15, must-revalidate" }
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EvaluationResponse"
+        "304":
+          description: Flag set unchanged since the ETag was issued.
+        "429":
+          description: Rate limit exceeded.
+          headers:
+            Retry-After:
+              schema: { type: integer }
+
+  /api/v1/reports:
+    get:
+      tags: [Reports]
+      operationId: listReports
+      summary: List damage reports (paginated)
+      parameters:
+        - name: per_page
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - name: page
+          in: query
+          schema: { type: integer, minimum: 1, default: 1 }
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [submitted, reviewing, approved, rejected, repaired]
+        - name: damage_type
+          in: query
+          schema:
+            type: string
+            enum: [dent, scratch, collision, glass, paint, other]
+        - name: severity
+          in: query
+          schema:
+            type: string
+            enum: [minor, moderate, severe]
+        - name: search
+          in: query
+          description: Substring match on reporter name/email, registration, reference.
+          schema: { type: string }
+      responses:
+        "200":
+          description: Paginated list.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaginatedReports"
+
+    post:
+      tags: [Reports]
+      operationId: createReport
+      summary: Submit a damage report
+      description: |
+        `photos[]` only persist when the `report-photos` flag is on for the
+        caller. `estimated_cost` only persists when `cost-estimate` is on.
+      security:
+        - sanctumBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StoreDamageReport"
+      responses:
+        "201": { description: Created, content: { application/json: { schema: { $ref: "#/components/schemas/DamageReportEnvelope" } } } }
+        "401": { description: Unauthenticated. }
+        "422": { description: Validation failed. }
+
+  /api/v1/reports/{report}:
+    parameters:
+      - { name: report, in: path, required: true, schema: { type: integer } }
+    get:
+      tags: [Reports]
+      operationId: showReport
+      summary: Show a damage report
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/DamageReportEnvelope" } } } }
+        "404": { description: Not found. }
+    patch:
+      tags: [Reports]
+      operationId: updateReport
+      summary: Update a damage report
+      security: [{ sanctumBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateDamageReport"
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/DamageReportEnvelope" } } } }
+        "401": { description: Unauthenticated. }
+        "404": { description: Not found. }
+        "422": { description: Validation failed. }
+
+  /api/v1/reports/bulk-delete:
+    post:
+      tags: [Reports]
+      operationId: bulkDeleteReports
+      summary: Bulk-delete reports — gated by `bulk-actions`
+      security: [{ sanctumBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids]
+              properties:
+                ids: { type: array, items: { type: integer }, minItems: 1, maxItems: 200 }
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted: { type: integer }
+        "401": { description: Unauthenticated. }
+        "403":
+          description: Feature disabled.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FeatureDisabled" }
+        "422": { description: Unknown id or empty payload. }
+
+  /api/v1/reports/{report}/export-pdf:
+    parameters:
+      - { name: report, in: path, required: true, schema: { type: integer } }
+    post:
+      tags: [Reports]
+      operationId: exportReportPdf
+      summary: Request a PDF export — gated by `export-pdf`
+      security: [{ sanctumBearer: [] }]
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  export_url: { type: string }
+                  generated_at: { type: string, format: date-time }
+        "401": { description: Unauthenticated. }
+        "403":
+          description: Feature disabled.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FeatureDisabled" }
+
+  /api/admin/flags:
+    get:
+      tags: [Admin]
+      operationId: listFlags
+      summary: List flags
+      security: [{ adminBearer: [] }]
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/FeatureFlag" } }
+        "401": { description: Unauthorized. }
+    post:
+      tags: [Admin]
+      operationId: createFlag
+      summary: Create a flag
+      security: [{ adminBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/FeatureFlagInput" }
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/FeatureFlag" }
+        "401": { description: Unauthorized. }
+        "422": { description: Validation failed. }
+
+  /api/admin/flags/{flag}:
+    parameters:
+      - { name: flag, in: path, required: true, schema: { type: integer } }
+    get:
+      tags: [Admin]
+      operationId: showFlag
+      summary: Show a flag
+      security: [{ adminBearer: [] }]
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/FeatureFlag" }
+    patch:
+      tags: [Admin]
+      operationId: updateFlag
+      summary: Update a flag
+      security: [{ adminBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/FeatureFlagInput" }
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/FeatureFlag" }
+    delete:
+      tags: [Admin]
+      operationId: deleteFlag
+      summary: Soft-delete a flag
+      security: [{ adminBearer: [] }]
+      responses:
+        "204": { description: Soft-deleted. }
+
+  /api/admin/decisions:
+    get:
+      tags: [Admin]
+      operationId: listDecisions
+      summary: Recent flag-evaluation decisions + aggregates
+      security: [{ adminBearer: [] }]
+      parameters:
+        - { name: flag_key, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 500 } }
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/DecisionRow" } }
+                  aggregates: { $ref: "#/components/schemas/DecisionAggregates" }
+
+  /api/admin/stats:
+    get:
+      tags: [Admin]
+      operationId: getStats
+      summary: Header counters for the admin UI
+      security: [{ adminBearer: [] }]
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AdminStats" }
+
+  /api/admin/personas:
+    get:
+      tags: [Admin]
+      operationId: listPersonas
+      summary: Seeded demo personas
+      security: [{ adminBearer: [] }]
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/Persona" } }
+
+  /api/admin/impersonate:
+    post:
+      tags: [Admin]
+      operationId: impersonate
+      summary: Mint a fresh Sanctum token for a seeded persona
+      security: [{ adminBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+                  expires_at: { type: string, format: date-time, nullable: true }
+                  user: { $ref: "#/components/schemas/Persona" }
+        "404":
+          description: Unknown user.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: { type: string, enum: [unknown_user] }
+
+components:
+  securitySchemes:
+    sanctumBearer:
+      type: http
+      scheme: bearer
+      description: Sanctum personal-access token minted by `/api/admin/impersonate`.
+    adminBearer:
+      type: http
+      scheme: bearer
+      description: Static admin token; never exposed to the browser.
+
+  schemas:
+    EvaluationResponse:
+      type: object
+      required: [flags, evaluated_at]
+      properties:
+        flags:
+          type: object
+          additionalProperties:
+            type: object
+            required: [value, reason]
+            properties:
+              value: { type: boolean }
+              reason: { type: string }
+        evaluated_at: { type: string, format: date-time }
+
+    FeatureFlag:
+      type: object
+      required:
+        - id
+        - key
+        - name
+        - description
+        - enabled
+        - default_value
+        - rules
+        - starts_at
+        - ends_at
+        - created_at
+        - updated_at
+      properties:
+        id: { type: integer }
+        key: { type: string, pattern: "^[a-z0-9][a-z0-9-]*$" }
+        name: { type: string }
+        description: { type: string, nullable: true }
+        enabled: { type: boolean }
+        default_value: { type: boolean }
+        rules: { type: array, items: { $ref: "#/components/schemas/Rule" } }
+        starts_at: { type: string, format: date-time, nullable: true }
+        ends_at: { type: string, format: date-time, nullable: true }
+        deleted_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    FeatureFlagInput:
+      type: object
+      required: [key, name, enabled, default_value]
+      properties:
+        key: { type: string, pattern: "^[a-z0-9][a-z0-9-]*$", maxLength: 128 }
+        name: { type: string, maxLength: 255 }
+        description: { type: string, maxLength: 1000, nullable: true }
+        enabled: { type: boolean }
+        default_value: { type: boolean }
+        starts_at: { type: string, format: date-time, nullable: true }
+        ends_at: { type: string, format: date-time, nullable: true }
+        rules: { type: array, items: { $ref: "#/components/schemas/Rule" } }
+
+    Rule:
+      oneOf:
+        - $ref: "#/components/schemas/UserTargetingRule"
+        - $ref: "#/components/schemas/AttributeRule"
+        - $ref: "#/components/schemas/PercentageRolloutRule"
+      discriminator:
+        propertyName: type
+        mapping:
+          user_targeting: "#/components/schemas/UserTargetingRule"
+          attribute: "#/components/schemas/AttributeRule"
+          percentage_rollout: "#/components/schemas/PercentageRolloutRule"
+
+    UserTargetingRule:
+      type: object
+      required: [type, user_keys, result]
+      properties:
+        type: { type: string, enum: [user_targeting] }
+        user_keys: { type: array, items: { type: string } }
+        result: { type: boolean }
+
+    AttributeRule:
+      type: object
+      required: [type, attribute, operator, value, result]
+      properties:
+        type: { type: string, enum: [attribute] }
+        attribute: { type: string }
+        operator: { type: string, enum: [equals, not_equals, in, not_in, contains] }
+        value: { description: "Scalar for equals/not_equals/contains; array for in/not_in." }
+        result: { type: boolean }
+
+    PercentageRolloutRule:
+      type: object
+      required: [type, percentage, salt, result]
+      properties:
+        type: { type: string, enum: [percentage_rollout] }
+        percentage: { type: number, minimum: 0, maximum: 100 }
+        salt: { type: string }
+        result: { type: boolean }
+
+    DamageReport:
+      type: object
+      required:
+        - id
+        - reference
+        - reporter_name
+        - reporter_email
+        - vehicle_registration
+        - vehicle_make
+        - vehicle_model
+        - location
+        - incident_at
+        - cover_image_url
+        - damage_type
+        - severity
+        - description
+        - photos
+        - estimated_cost
+        - status
+        - created_at
+        - updated_at
+      properties:
+        id: { type: integer }
+        reference: { type: string }
+        reporter_name: { type: string }
+        reporter_email: { type: string, format: email }
+        vehicle_registration: { type: string }
+        vehicle_make: { type: string, nullable: true }
+        vehicle_model: { type: string, nullable: true }
+        location: { type: string, nullable: true }
+        incident_at: { type: string, format: date-time, nullable: true }
+        cover_image_url: { type: string, nullable: true }
+        damage_type: { type: string, enum: [dent, scratch, collision, glass, paint, other] }
+        severity: { type: string, enum: [minor, moderate, severe] }
+        description: { type: string }
+        photos:
+          type: array
+          items:
+            type: object
+            required: [url]
+            properties:
+              url: { type: string }
+              caption: { type: string, nullable: true }
+        estimated_cost: { type: number, nullable: true }
+        status: { type: string, enum: [submitted, reviewing, approved, rejected, repaired] }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    DamageReportEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data: { $ref: "#/components/schemas/DamageReport" }
+
+    PaginatedReports:
+      type: object
+      required: [data, links, meta]
+      properties:
+        data: { type: array, items: { $ref: "#/components/schemas/DamageReport" } }
+        links:
+          type: object
+          required: [first, last, prev, next]
+          properties:
+            first: { type: string, nullable: true }
+            last: { type: string, nullable: true }
+            prev: { type: string, nullable: true }
+            next: { type: string, nullable: true }
+        meta:
+          type: object
+          required: [current_page, last_page, per_page, total]
+          properties:
+            current_page: { type: integer }
+            from: { type: integer, nullable: true }
+            last_page: { type: integer }
+            per_page: { type: integer }
+            to: { type: integer, nullable: true }
+            total: { type: integer }
+
+    StoreDamageReport:
+      type: object
+      required: [reporter_name, reporter_email, vehicle_registration, damage_type, severity, description]
+      properties:
+        reporter_name: { type: string, maxLength: 255 }
+        reporter_email: { type: string, format: email, maxLength: 255 }
+        vehicle_registration: { type: string, maxLength: 32 }
+        vehicle_make: { type: string, maxLength: 100, nullable: true }
+        vehicle_model: { type: string, maxLength: 100, nullable: true }
+        location: { type: string, maxLength: 255, nullable: true }
+        incident_at: { type: string, format: date-time, nullable: true }
+        cover_image_url: { type: string, format: uri, maxLength: 1024, nullable: true }
+        damage_type: { type: string, enum: [dent, scratch, collision, glass, paint, other] }
+        severity: { type: string, enum: [minor, moderate, severe] }
+        description: { type: string, maxLength: 2000 }
+        photos:
+          type: array
+          maxItems: 8
+          items:
+            type: object
+            required: [url]
+            properties:
+              url: { type: string, format: uri, maxLength: 1024 }
+              caption: { type: string, maxLength: 255, nullable: true }
+        estimated_cost: { type: number, minimum: 0, maximum: 1000000, nullable: true }
+        request_ai_analysis: { type: boolean, nullable: true }
+
+    UpdateDamageReport:
+      allOf:
+        - $ref: "#/components/schemas/StoreDamageReport"
+        - description: "Partial — every property is optional."
+
+    FeatureDisabled:
+      type: object
+      required: [error, flag, message]
+      properties:
+        error: { type: string, enum: [feature_disabled] }
+        flag: { type: string }
+        message: { type: string }
+
+    DecisionRow:
+      type: object
+      required: [id, flag_key, result, reason, decided_at]
+      properties:
+        id: { type: integer }
+        flag_key: { type: string }
+        result: { type: boolean }
+        reason: { type: string }
+        user_key: { type: string, nullable: true }
+        context:
+          type: object
+          required: [user_key, attributes]
+          properties:
+            user_key: { type: string, nullable: true }
+            attributes:
+              type: object
+              additionalProperties: true
+        decided_at: { type: string, format: date-time }
+
+    DecisionAggregates:
+      type: object
+      required: [total, by_reason, by_result]
+      properties:
+        total: { type: integer }
+        by_reason:
+          type: object
+          additionalProperties: { type: integer }
+        by_result:
+          type: object
+          properties:
+            "true": { type: integer }
+            "false": { type: integer }
+
+    AdminStats:
+      type: object
+      required:
+        - total_flags
+        - added_this_month
+        - active_rollouts
+        - scheduled
+        - evaluations_24h
+        - evaluations_24h_by_flag
+        - cache
+      properties:
+        total_flags: { type: integer }
+        added_this_month: { type: integer }
+        active_rollouts: { type: integer }
+        scheduled: { type: integer }
+        next_scheduled_at: { type: string, format: date-time, nullable: true }
+        next_scheduled_key: { type: string, nullable: true }
+        evaluations_24h: { type: integer }
+        evaluations_24h_delta: { type: integer, nullable: true }
+        evaluations_24h_by_flag:
+          type: object
+          additionalProperties: { type: integer }
+        cache:
+          type: object
+          required: [ttl_seconds, status]
+          properties:
+            hit_rate: { type: number, nullable: true }
+            ttl_seconds: { type: integer }
+            status: { type: string, enum: [ok, unavailable] }
+
+    Persona:
+      type: object
+      required: [id, name, email, role, country]
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        email: { type: string, format: email }
+        role: { type: string }
+        country: { type: string }
