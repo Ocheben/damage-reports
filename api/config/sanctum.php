@@ -2,7 +2,6 @@
 
 use Illuminate\Cookie\Middleware\EncryptCookies;
 use Illuminate\Foundation\Http\Middleware\ValidateCsrfToken;
-use Laravel\Sanctum\Sanctum;
 
 return [
 
